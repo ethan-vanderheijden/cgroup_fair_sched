@@ -66,6 +66,9 @@ struct cpu_ctx {
     // access to assigned_cgroup is racy, but that's OK
     // if a process is placed in the wrong queue, it will get fixed on the next dispatch
     u32 assigned_cgroup;  // 0 indicates no assigned cgroup
+    // temporary cpumask used in find_direct_dispatch()
+    // but better to allocated once when CPU initializes than on every call
+    struct bpf_cpumask __kptr *should_interrupt;
 };
 
 struct {
@@ -188,27 +191,31 @@ static s32 find_direct_dispatch(struct cgroup *cgrp, bool *direct_dispatch, bool
             *direct_dispatch = true;
             return idle_affinity;
         } else {
-            struct bpf_cpumask *should_interrupt = bpf_cpumask_create();
-            if (should_interrupt == NULL) {
-                scx_bpf_error("Failed to create cpumask for should_interrupt");
-            } else {
-                struct bpf_cpumask *foreign_affinity = get_cpu_affinity();
-                if (foreign_affinity != NULL) {
-                    bpf_cpumask_and(should_interrupt, (cpumask_t *)soft_pin,
-                                    (cpumask_t *)foreign_affinity);
-                    if (!bpf_cpumask_empty((cpumask_t *)should_interrupt)) {
-                        s32 to_interrupt = scx_bpf_pick_any_cpu((cpumask_t *)should_interrupt, 0);
-                        if (to_interrupt >= 0) {
-                            stat_inc(3);
-                            *direct_dispatch = true;
-                            *must_interrupt = true;
-                            bpf_cpumask_release(should_interrupt);
-                            return to_interrupt;
-                        }
-                    }
-                }
-                bpf_cpumask_release(should_interrupt);
+            struct cpu_ctx *curr_ctx = get_cpu_ctx();
+            if (curr_ctx == NULL) {
+                goto skip;
             }
+            struct bpf_cpumask *should_interrupt = curr_ctx->should_interrupt;
+            if (should_interrupt == NULL) {
+                goto skip;
+            }
+            struct bpf_cpumask *foreign_affinity = get_cpu_affinity();
+            if (foreign_affinity == NULL) {
+                goto skip;
+            }
+
+            bpf_cpumask_and(should_interrupt, (cpumask_t *)soft_pin, (cpumask_t *)foreign_affinity);
+            if (!bpf_cpumask_empty((cpumask_t *)should_interrupt)) {
+                s32 to_interrupt = scx_bpf_pick_any_cpu((cpumask_t *)should_interrupt, 0);
+                if (to_interrupt >= 0) {
+                    stat_inc(3);
+                    *direct_dispatch = true;
+                    *must_interrupt = true;
+                    return to_interrupt;
+                }
+            }
+
+        skip:
 
             cpu = scx_bpf_pick_any_cpu((cpumask_t *)soft_pin, 0);
         }
@@ -290,20 +297,18 @@ void BPF_STRUCT_OPS(cgroup_fair_dispatch, s32 cpu, struct task_struct *prev) {
     }
 
     struct cpu_ctx *curr_ctx = get_cpu_ctx();
-    if (curr_ctx != NULL) {
-        if (curr_ctx->assigned_cgroup > 0) {
-            if (scx_bpf_dsq_move_to_local(curr_ctx->assigned_cgroup)) {
-                // successfully switched out `prev` with a local-affinity process
-                stat_inc(0);
+    if (curr_ctx != NULL && curr_ctx->assigned_cgroup > 0) {
+        if (scx_bpf_dsq_move_to_local(curr_ctx->assigned_cgroup)) {
+            // successfully switched out `prev` with a local-affinity process
+            stat_inc(0);
+            return;
+        } else if (prev != NULL) {
+            struct bpf_cpumask *foreign_affinity = get_cpu_affinity();
+            if (foreign_affinity != NULL &&
+                !bpf_cpumask_test_cpu(cpu, (cpumask_t *)foreign_affinity)) {
+                // `prev` is a local-affinity process, let it keep running
+                stat_inc(1);
                 return;
-            } else if (prev != NULL) {
-                struct bpf_cpumask *foreign_affinity = get_cpu_affinity();
-                if (foreign_affinity != NULL &&
-                    !bpf_cpumask_test_cpu(cpu, (cpumask_t *)foreign_affinity)) {
-                    // `prev` is a local-affinity process, let it keep running
-                    stat_inc(1);
-                    return;
-                }
             }
         }
     }
@@ -512,6 +517,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cgroup_fair_init) {
         bool *is_enabled = bpf_map_lookup_percpu_elem(&enabled, &key, i);
         if (is_enabled != NULL && *is_enabled) {
             bpf_cpumask_set_cpu(i, new_mask);
+
+            struct cpu_ctx *cpu_context = bpf_map_lookup_percpu_elem(&cpu_ctx_array, &key, i);
+            if (cpu_context == NULL) {
+                scx_bpf_error("Failed to get CPU context for CPU %d", i);
+                bpf_cpumask_release(new_mask);
+                bpf_cpumask_release(new_mask2);
+                return -ENOENT;
+            }
+            struct bpf_cpumask *temp_mask = bpf_cpumask_create();
+            if (temp_mask == NULL) {
+                scx_bpf_error("Failed to allocate should_interrupt cpumask for CPU %d", i);
+                bpf_cpumask_release(new_mask);
+                bpf_cpumask_release(new_mask2);
+                return -ENOMEM;
+            }
+            struct bpf_cpumask *old = bpf_kptr_xchg(&cpu_context->should_interrupt, temp_mask);
+            if (old != NULL) {
+                bpf_cpumask_release(old);
+            }
         }
     }
     bpf_cpumask_copy(new_mask2, (cpumask_t *)new_mask);
