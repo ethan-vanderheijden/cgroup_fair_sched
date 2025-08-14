@@ -36,12 +36,12 @@ static void sigint_handler(int simple) { exit_req = 1; }
 
 static void read_stats(struct cgroup_fair_bpf *skel, __u64 *stats) {
     int nr_cpus = libbpf_num_possible_cpus();
-    __u64 cnts[3][nr_cpus];
+    __u64 cnts[4][nr_cpus];
     __u32 idx;
 
-    memset(stats, 0, sizeof(stats[0]) * 3);
+    memset(stats, 0, sizeof(stats[0]) * 4);
 
-    for (idx = 0; idx < 3; idx++) {
+    for (idx = 0; idx < 4; idx++) {
         int ret, cpu;
 
         ret = bpf_map_lookup_elem(bpf_map__fd(skel->maps.stats), &idx, cnts[idx]);
@@ -175,10 +175,10 @@ int main(int argc, char **argv) {
     link = bpf_map__attach_struct_ops(skel->maps.sched_ops);
 
     while (!exit_req && !UEI_EXITED(skel, uei)) {
-        __u64 stats[3];
+        __u64 stats[4];
 
         read_stats(skel, stats);
-        printf("switch=%llu re-ran=%llu, direct-dispatch=%llu\n", stats[0], stats[1], stats[2]);
+        printf("switch: %llu, re-ran: %llu, direct-dispatch: %llu, interrupted: %llu\n", stats[0], stats[1], stats[2], stats[3]);
         fflush(stdout);
         sleep(1);
     }
