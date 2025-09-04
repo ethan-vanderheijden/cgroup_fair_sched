@@ -16,6 +16,7 @@ struct cpumask_wrapper {
     struct bpf_cpumask __kptr *mask;
 };
 
+// this is initialized by whoever loads the eBPF
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(map_flags, BPF_F_RDONLY_PROG);
@@ -32,6 +33,7 @@ struct {
     __uint(max_entries, 1);
 } valid_cpus SEC(".maps");
 
+// subset of `enabled` with only CPUs that are not assigned to a cgroup yet
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, int);
@@ -39,6 +41,7 @@ struct {
     __uint(max_entries, 1);
 } unallocated_cpus SEC(".maps");
 
+// CPUs that are currently running tasks not belonging to their assigned cgroup
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, int);
@@ -68,7 +71,7 @@ struct cpu_ctx {
     u32 assigned_cgroup;  // 0 indicates no assigned cgroup
     // temporary cpumask used in find_direct_dispatch()
     // but better to allocated once when CPU initializes than on every call
-    struct bpf_cpumask __kptr *should_interrupt;
+    struct bpf_cpumask __kptr *temp_mask;
 };
 
 struct {
@@ -117,50 +120,31 @@ static struct cgroup_ctx *get_cgroup_ctx(struct cgroup *cgrp) {
     return bpf_cgrp_storage_get(&cgroup_ctx_array, cgrp, NULL, 0);
 }
 
-static struct bpf_cpumask *lock_unallocated_cpus(void) {
-    u32 key = 0;
-    struct cpumask_wrapper *value = bpf_map_lookup_elem(&unallocated_cpus, &key);
-    bpf_rcu_read_lock();
-    if (value == NULL) {
-        scx_bpf_error("Failed to get unallocated cpumask");
-        return NULL;
-    }
-    struct bpf_cpumask *mask = value->mask;
-    if (mask == NULL) {
-        scx_bpf_error("No cpumask found for unallocated CPUs");
-        return NULL;
-    }
+#define GET_MAP(map)                                                 \
+    u32 key = 0;                                                     \
+    struct cpumask_wrapper *value = bpf_map_lookup_elem(&map, &key); \
+    if (value == NULL) {                                             \
+        scx_bpf_error("Failed to get " #map " cpumask");             \
+        return NULL;                                                 \
+    }                                                                \
+    struct bpf_cpumask *mask = value->mask;                          \
+    if (mask == NULL) {                                              \
+        scx_bpf_error("No cpumask found for " #map " CPUs");         \
+        return NULL;                                                 \
+    }                                                                \
     return mask;
+
+static struct bpf_cpumask *lock_unallocated_cpus(void) {
+    bpf_rcu_read_lock();
+    GET_MAP(unallocated_cpus);
 }
 
 static struct bpf_cpumask *get_valid_cpus(void) {
-    u32 key = 0;
-    struct cpumask_wrapper *value = bpf_map_lookup_elem(&valid_cpus, &key);
-    if (value == NULL) {
-        scx_bpf_error("Failed to get valid cpumask");
-        return NULL;
-    }
-    struct bpf_cpumask *mask = value->mask;
-    if (mask == NULL) {
-        scx_bpf_error("No cpumask found for valid CPUs");
-        return NULL;
-    }
-    return mask;
+    GET_MAP(valid_cpus);
 }
 
 static struct bpf_cpumask *get_cpu_affinity(void) {
-    u32 key = 0;
-    struct cpumask_wrapper *value = bpf_map_lookup_elem(&cpus_foreign_affinity, &key);
-    if (value == NULL) {
-        scx_bpf_error("Failed to get cpus with foreign affinity cpumask");
-        return NULL;
-    }
-    struct bpf_cpumask *mask = value->mask;
-    if (mask == NULL) {
-        scx_bpf_error("No cpumask found for cpus with foreign affinity");
-        return NULL;
-    }
-    return mask;
+    GET_MAP(cpus_foreign_affinity);
 }
 
 static u64 *get_task_start_time(struct task_struct *p) {
@@ -195,7 +179,7 @@ static s32 find_direct_dispatch(struct cgroup *cgrp, bool *direct_dispatch, bool
             if (curr_ctx == NULL) {
                 goto skip;
             }
-            struct bpf_cpumask *should_interrupt = curr_ctx->should_interrupt;
+            struct bpf_cpumask *should_interrupt = curr_ctx->temp_mask;
             if (should_interrupt == NULL) {
                 goto skip;
             }
@@ -527,12 +511,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cgroup_fair_init) {
             }
             struct bpf_cpumask *temp_mask = bpf_cpumask_create();
             if (temp_mask == NULL) {
-                scx_bpf_error("Failed to allocate should_interrupt cpumask for CPU %d", i);
+                scx_bpf_error("Failed to allocate temp_mask cpumask for CPU %d", i);
                 bpf_cpumask_release(new_mask);
                 bpf_cpumask_release(new_mask2);
                 return -ENOMEM;
             }
-            struct bpf_cpumask *old = bpf_kptr_xchg(&cpu_context->should_interrupt, temp_mask);
+            struct bpf_cpumask *old = bpf_kptr_xchg(&cpu_context->temp_mask, temp_mask);
             if (old != NULL) {
                 bpf_cpumask_release(old);
             }
