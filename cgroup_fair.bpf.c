@@ -41,6 +41,22 @@ struct {
     __uint(max_entries, 1);
 } unallocated_cpus SEC(".maps");
 
+struct cgv_node {
+    struct bpf_rb_node rb_node;
+    // manually dispatched foreign procs are pre-emptively charged for an entire timeslice
+    // cgroup_ctx.delta_foreign_time is the (SLICE - actual running time) of foreign procs
+    // so foreign_time - delta_foreign_time is the actual foreign time
+
+    // Note: direct dispatched foreign procs are completely ignored
+    // probably OK since direct dispatch only happens if there is no contention for foreign CPUs
+    u64 foreign_time;
+    u64 cgid;
+};
+
+u64 max_foreign_time;
+private(CGV_TREE) struct bpf_spin_lock cgv_lock;
+private(CGV_TREE) struct bpf_rb_root cgv_tree __contains(cgv_node, rb_node);
+
 // CPUs that are currently running tasks not belonging to their assigned cgroup
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -52,10 +68,15 @@ struct {
 struct cgroup_ctx {
     // access is not racy since it is only mutated on cgroup init/exit
     struct bpf_cpumask __kptr *soft_pin;
+    u16 cpus_allocated;  // acts as the "effective weight" of the cgroup
     // stores max scx.dsq_vtime for any process in this cgroup that has run
     // difference between any task->scx.dsq_vtime is the lag time
     // Warning: make sure to reset lag time in task init and wakeup!
     u64 max_vtime;
+    // accumulates cgroup proc's foreign running time asynchronously (Warning: updated
+    // concurrently!) subtract from cgv_node.foreign_time when possible
+    int delta_foreign_time;
+    struct cgv_node __kptr *node_stash;  // NULL if the node is currently in the rbtree
 };
 
 struct {
@@ -69,6 +90,7 @@ struct cpu_ctx {
     // access to assigned_cgroup is racy, but that's OK
     // if a process is placed in the wrong queue, it will get fixed on the next dispatch
     u32 assigned_cgroup;  // 0 indicates no assigned cgroup
+    bool foreign_dispatched;
     // temporary cpumask used in find_direct_dispatch()
     // but better to allocated once when CPU initializes than on every call
     struct bpf_cpumask __kptr *temp_mask;
@@ -92,8 +114,9 @@ struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u64));
-    /* [switch with local affinity, re-ran prev, direct dispatch, interrupted] */
-    __uint(max_entries, 4);
+    /* [switch with local affinity, re-ran prev, direct dispatch, interrupted, dispatched foreign]
+     */
+    __uint(max_entries, 5);
 } stats SEC(".maps");
 
 static bool is_enabled(void) {
@@ -139,13 +162,9 @@ static struct bpf_cpumask *lock_unallocated_cpus(void) {
     GET_MAP(unallocated_cpus);
 }
 
-static struct bpf_cpumask *get_valid_cpus(void) {
-    GET_MAP(valid_cpus);
-}
+static struct bpf_cpumask *get_valid_cpus(void) { GET_MAP(valid_cpus); }
 
-static struct bpf_cpumask *get_cpu_affinity(void) {
-    GET_MAP(cpus_foreign_affinity);
-}
+static struct bpf_cpumask *get_cpu_affinity(void) { GET_MAP(cpus_foreign_affinity); }
 
 static u64 *get_task_start_time(struct task_struct *p) {
     u64 *stats = bpf_task_storage_get(&task_start_time, p, 0, 0);
@@ -154,6 +173,28 @@ static u64 *get_task_start_time(struct task_struct *p) {
         return NULL;
     }
     return stats;
+}
+
+static bool cgv_comparator(struct bpf_rb_node *a, const struct bpf_rb_node *b) {
+    struct cgv_node *cgv_a = container_of(a, struct cgv_node, rb_node);
+    struct cgv_node *cgv_b = container_of(b, struct cgv_node, rb_node);
+    return cgv_a->foreign_time < cgv_b->foreign_time;
+}
+
+// cgroup has extra processes that might want to run on foreign CPUs
+static void enqueue_cgroup(struct cgroup_ctx *cgrp_ctx, struct cgv_node *node) {
+    int time_offset = __sync_lock_test_and_set(&cgrp_ctx->delta_foreign_time, 0);
+    node->foreign_time -= time_offset;
+
+    // budget of "SLICE" means the cgroup can monopolize "cpus_allocated" foreign CPUs for one timeslice
+    u64 max_budget = SLICE * 3;
+    // cgroups may stay off the rbtree for a long time if their processes are idle
+    // must cap lag time to a reasonable amount
+    if (time_before(node->foreign_time, max_foreign_time - max_budget)) {
+        node->foreign_time = max_foreign_time - max_budget;
+    }
+
+    bpf_rbtree_add(&cgv_tree, &node->rb_node, cgv_comparator);
 }
 
 static void stat_inc(u32 idx) {
@@ -271,6 +312,12 @@ void BPF_STRUCT_OPS(cgroup_fair_enqueue, struct task_struct *p, u64 enq_flags) {
         scx_bpf_dsq_insert(p, FALLBACK_DSQ, SLICE, enq_flags);
     } else {
         scx_bpf_dsq_insert_vtime(p, cgrp->kn->id, SLICE, p->scx.dsq_vtime, enq_flags);
+        struct cgv_node *node = bpf_kptr_xchg(&cgrp_ctx->node_stash, NULL);
+        if (node) {
+            bpf_spin_lock(&cgv_lock);
+            enqueue_cgroup(cgrp_ctx, node);
+            bpf_spin_unlock(&cgv_lock);
+        }
     }
     bpf_cgroup_release(cgrp);
 }
@@ -297,8 +344,77 @@ void BPF_STRUCT_OPS(cgroup_fair_dispatch, s32 cpu, struct task_struct *prev) {
         }
     }
 
-    // prev cannot possibly be a local-affinity process, switch it with another foreign process
+    // prev cannot possibly be a local-affinity process, switch it with a foreign process
+    // check FALLBACK_DSQ first to ensure it doesn't starve
     scx_bpf_dsq_move_to_local(FALLBACK_DSQ);
+
+    // we know this loop will terminate early since we are slowly draining the rbtree
+    // but the verifier needs an explicit bound
+    bpf_repeat(1000) {
+        bpf_spin_lock(&cgv_lock);
+        struct bpf_rb_node *rb_node = bpf_rbtree_first(&cgv_tree);
+        if (rb_node == NULL) {
+            bpf_spin_unlock(&cgv_lock);
+            // tree is empty
+            break;
+        }
+
+        rb_node = bpf_rbtree_remove(&cgv_tree, rb_node);
+        bpf_spin_unlock(&cgv_lock);
+
+        if (rb_node == NULL) {
+            scx_bpf_error("Failed to remove left node from cgv_tree");
+            break;
+        }
+
+        struct cgv_node *cgv = container_of(rb_node, struct cgv_node, rb_node);
+
+        struct cgroup *cgrp = bpf_cgroup_from_id(cgv->cgid);
+        if (cgrp == NULL) {
+            scx_bpf_error("Failed to get cgroup %llu", cgv->cgid);
+            bpf_obj_drop(cgv);
+            break;
+        }
+        struct cgroup_ctx *cgrp_ctx = get_cgroup_ctx(cgrp);
+        if (cgrp_ctx == NULL) {
+            scx_bpf_error("Failed to get cgroup_ctx for cgroup %llu", cgv->cgid);
+            bpf_cgroup_release(cgrp);
+            bpf_obj_drop(cgv);
+            break;
+        }
+
+        // move might fail if local-affinity CPUs end up grabbing all the processes
+        bool found_proc = scx_bpf_dsq_move_to_local(cgv->cgid);
+        if (found_proc) {
+            stat_inc(4);
+
+            if (time_before(max_foreign_time, cgv->foreign_time)) {
+                max_foreign_time = cgv->foreign_time;
+            }
+
+            cgv->foreign_time += SLICE / cgrp_ctx->cpus_allocated;
+            struct cpu_ctx *curr_ctx = get_cpu_ctx();
+            if (curr_ctx != NULL) {
+                curr_ctx->foreign_dispatched = true;
+            }
+        }
+
+        if (scx_bpf_dsq_nr_queued(cgv->cgid) > 0) {
+            bpf_spin_lock(&cgv_lock);
+            enqueue_cgroup(cgrp_ctx, cgv);
+            bpf_spin_unlock(&cgv_lock);
+        } else {
+            struct cgv_node *old = bpf_kptr_xchg(&cgrp_ctx->node_stash, cgv);
+            if (old) {
+                bpf_obj_drop(old);
+            }
+        }
+        bpf_cgroup_release(cgrp);
+
+        if (found_proc) {
+            break;
+        }
+    }
 }
 
 void BPF_STRUCT_OPS(cgroup_fair_running, struct task_struct *p) {
@@ -340,7 +456,23 @@ void BPF_STRUCT_OPS(cgroup_fair_stopping, struct task_struct *p, bool runnable) 
     u64 *start = get_task_start_time(p);
     if (start != NULL) {
         u64 now = scx_bpf_now();
-        p->scx.dsq_vtime += now - *start;
+        u64 vtime = now - *start;
+        p->scx.dsq_vtime += vtime;
+
+        struct cgroup *cgrp = scx_bpf_task_cgroup(p);
+        struct cpu_ctx *curr_ctx = get_cpu_ctx();
+        if (curr_ctx != NULL) {
+            if (curr_ctx->foreign_dispatched) {
+                struct cgroup_ctx *cgrp_ctx = get_cgroup_ctx(cgrp);
+                if (cgrp_ctx != NULL) {
+                    __sync_fetch_and_add(
+                        &cgrp_ctx->delta_foreign_time,
+                        (SLICE - vtime) / cgrp_ctx->cpus_allocated);
+                }
+            }
+            curr_ctx->foreign_dispatched = false;
+        }
+        bpf_cgroup_release(cgrp);
     }
 }
 
@@ -383,6 +515,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cgroup_fair_cgroup_init, struct cgroup *cgrp,
     }
 
     int cpus_needed = div_round_up(args->weight, 100);
+    state->cpus_allocated = cpus_needed;
     if (scx_bpf_create_dsq(cgrp->kn->id, -1)) {
         scx_bpf_error("Failed to create dispatch queue for cgroup %llu", cgrp->kn->id);
         ret = -ENOMEM;
@@ -427,6 +560,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cgroup_fair_cgroup_init, struct cgroup *cgrp,
     struct bpf_cpumask *old_pin = bpf_kptr_xchg(&state->soft_pin, soft_pin);
     if (old_pin) {
         bpf_cpumask_release(old_pin);
+    }
+
+    struct cgv_node *node = bpf_obj_new(struct cgv_node);
+    if (node == NULL) {
+        scx_bpf_error("Failed to allocate cgv_node for cgroup %llu", cgrp->kn->id);
+        ret = -ENOMEM;
+        goto unlock;
+    }
+
+    node->cgid = cgrp->kn->id;
+    struct cgv_node *old_node = bpf_kptr_xchg(&state->node_stash, node);
+    if (old_node) {
+        bpf_obj_drop(old_node);
     }
 
 unlock:
